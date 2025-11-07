@@ -1,29 +1,77 @@
-FROM python:3.11-slim-bookworm
+# Multi-stage build for optimized production image
+FROM python:3.12-slim-bookworm AS builder
 
-ENV GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no"
-
-RUN apt-get update \
-    && apt-get install -y libgl1 libglib2.0-0 curl wget git procps \
+# Install build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# This will install torch with *only* cpu support
-# Remove the --extra-index-url part if you want to install all the gpu requirements
-# For more details in the different torch distribution visit https://pytorch.org/.
-RUN pip install --no-cache-dir docling --extra-index-url https://download.pytorch.org/whl/cpu
+# Set working directory
+WORKDIR /app
 
-ENV HF_HOME=/tmp/
-ENV TORCH_HOME=/tmp/
+# Clone and install docling with CPU-only torch
+RUN git clone https://github.com/atarazevich/docling.git /tmp/docling && \
+    cd /tmp/docling && \
+    pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir \
+    fastapi==0.115.5 \
+    uvicorn[standard]==0.32.1 \
+    python-multipart==0.0.12 \
+    httpx==0.27.2 \
+    prometheus-client==0.21.0
 
-COPY docs/examples/minimal.py /root/minimal.py
+# Production stage
+FROM python:3.12-slim-bookworm
 
-RUN docling-tools models download
+# Install runtime dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    curl \
+    wget \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
 
-# On container environments, always set a thread budget to avoid undesired thread congestion.
+# Create non-root user for security
+RUN useradd -m -u 1000 docling && \
+    mkdir -p /home/docling/.cache /home/docling/models && \
+    chown -R docling:docling /home/docling
+
+# Copy Python packages from builder
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Switch to non-root user
+USER docling
+WORKDIR /home/docling
+
+# Set environment variables for model caching
+ENV HF_HOME=/home/docling/.cache/huggingface
+ENV TORCH_HOME=/home/docling/.cache/torch
+ENV DOCLING_ARTIFACTS_PATH=/home/docling/models
 ENV OMP_NUM_THREADS=4
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
 
-# On container shell:
-# > cd /root/
-# > python minimal.py
+# Pre-download models during build to avoid runtime delays
+RUN python -c "from docling.document_converter import DocumentConverter; converter = DocumentConverter()" 2>/dev/null || true && \
+    docling-tools models download || true
 
-# Running as `docker run -e DOCLING_ARTIFACTS_PATH=/root/.cache/docling/models` will use the
-# model weights included in the container image.
+# Copy the FastAPI application
+COPY --chown=docling:docling api.py /home/docling/api.py
+
+# Expose port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Run the FastAPI application
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--log-level", "info"]
